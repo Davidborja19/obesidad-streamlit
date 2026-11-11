@@ -1,22 +1,26 @@
 """
 Dashboard en Streamlit - Estimación de niveles de obesidad
-Mismo preprocesamiento y mismos 4 modelos del notebook estimacion_niveles_obesidad.ipynb
-(Random Forest, Árbol de decisión, SVM y Regresión logística).
+Replica el notebook estimacion_niveles_obesidad.ipynb: mismo preprocesamiento, misma partición 80/20
+(random_state=42) y los 4 modelos con los hiperparámetros AJUSTADOS del Paso 9 (GridSearchCV).
 
 Ejecutar con:   streamlit run app.py
 Tema oscuro:    ver .streamlit/config.toml
 """
 import os
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from sklearn.compose import ColumnTransformer
+from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, recall_score
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import (accuracy_score, classification_report, confusion_matrix, f1_score,
+                             recall_score)
+from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
@@ -40,17 +44,36 @@ NUM_COLS = ['Age', 'Height', 'Weight', 'FCVC', 'NCP', 'CH2O', 'FAF', 'TUE']
 BINARIAS = ['family_history_with_overweight', 'FAVC', 'SMOKE', 'SCC']
 FRECUENCIA = {'no': 0, 'Sometimes': 1, 'Frequently': 2, 'Always': 3}
 RUTA_CSV = "obesity.csv"   # opcional: si existe junto a app.py se usa en vez de descargar de UCI
+MODELO_FINAL = 'Random Forest'   # elegido en el Paso 10 del notebook
 
 CONJUNTOS = {
     'completo': 'Completo (con peso y estatura)',
     'habitos': 'Solo hábitos (sin peso ni estatura)',
 }
 
+# Modelos con los hiperparámetros AJUSTADOS (Paso 9 del notebook, GridSearchCV)
 MODELOS = {
+    'Random Forest':       lambda: RandomForestClassifier(n_estimators=400, bootstrap=False, max_features='sqrt',
+                                                          min_samples_leaf=2, criterion='gini', random_state=42),
+    'Árbol de decisión':   lambda: DecisionTreeClassifier(criterion='entropy', max_depth=15, min_samples_leaf=1,
+                                                          random_state=42),
+    'SVM (RBF)':           lambda: SVC(kernel='rbf', C=10, gamma=0.3, probability=True, random_state=42),
+    'Regresión logística': lambda: LogisticRegression(C=100, max_iter=1000, random_state=42),
+}
+# Los mismos modelos con valores POR DEFECTO (Paso 7), solo para comparar "antes vs después"
+MODELOS_DEFECTO = {
     'Random Forest':       lambda: RandomForestClassifier(n_estimators=400, random_state=42),
     'Árbol de decisión':   lambda: DecisionTreeClassifier(random_state=42),
     'SVM (RBF)':           lambda: SVC(kernel='rbf', C=1.0, gamma='scale', probability=True, random_state=42),
     'Regresión logística': lambda: LogisticRegression(max_iter=1000, random_state=42),
+}
+# Hiperparámetros que se ajustaron: (valor por defecto, valor ajustado)
+HIPERPARAMETROS = {
+    'Random Forest': {'bootstrap': (True, False), 'max_features': ('sqrt', 'sqrt'),
+                      'min_samples_leaf': (1, 2), 'criterion': ('gini', 'gini')},
+    'Árbol de decisión': {'criterion': ('gini', 'entropy'), 'max_depth': (None, 15), 'min_samples_leaf': (1, 1)},
+    'SVM (RBF)': {'C': (1, 10), 'gamma': ('scale', 0.3)},
+    'Regresión logística': {'C': (1, 100)},
 }
 
 # ----------------------------------------------------------------------------
@@ -71,7 +94,7 @@ footer { visibility: hidden; }
 .subtitulo { color: #8B909C; font-size: 1rem; max-width: 46rem; margin-bottom: 1.6rem; }
 
 .rotulo { font-size: .72rem; letter-spacing: .12em; text-transform: uppercase; color: #8B909C;
-          font-weight: 600; margin: 0 0 .5rem 0; padding-bottom: .4rem; border-bottom: 1px solid #262B36; }
+          font-weight: 600; margin: 1.1rem 0 .5rem 0; padding-bottom: .4rem; border-bottom: 1px solid #262B36; }
 
 .hero { background: #161A22; border: 1px solid #262B36; border-radius: 14px; padding: 1.25rem 1.5rem; margin-bottom: .8rem; }
 .hero .k { font-size: .72rem; letter-spacing: .12em; text-transform: uppercase; color: #8B909C; font-weight: 600; }
@@ -89,6 +112,7 @@ footer { visibility: hidden; }
 [data-testid="stSidebar"] { border-right: 1px solid #262B36; }
 [data-testid="stExpander"] { border: 1px solid #262B36; border-radius: 12px; background: #12151B; }
 .nota { font-size: .82rem; color: #8B909C; border-left: 2px solid #4FB3A5; padding-left: .8rem; margin-top: 1rem; line-height: 1.5; }
+.creditos { font-size: .74rem; color: #6B7080; margin-top: 1.6rem; line-height: 1.6; }
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -133,7 +157,7 @@ def cargar_datos():
 
 
 def preparar(df):
-    """Mismo preprocesamiento del notebook (Paso 4 y 5): duplicados, binarias, ordinales, One-Hot, target."""
+    """Mismo preprocesamiento del notebook (Pasos 4 y 5): duplicados, binarias, ordinales, One-Hot, target."""
     df = df.drop_duplicates().reset_index(drop=True)
     crudo = df.copy()                                           # copia legible para el análisis exploratorio
     for col in BINARIAS:
@@ -153,33 +177,107 @@ def construir_pipeline(modelo, columnas):
     return Pipeline([('prep', prep), ('modelo', modelo)])
 
 
-@st.cache_resource(show_spinner="Entrenando los 4 modelos (solo la primera vez)...")
+def metricas(y_real, y_pred):
+    """Las 3 métricas del proyecto."""
+    return {'Accuracy': accuracy_score(y_real, y_pred),
+            'Recall macro': recall_score(y_real, y_pred, average='macro'),
+            'F1 macro': f1_score(y_real, y_pred, average='macro')}
+
+
+@st.cache_resource(show_spinner="Entrenando los modelos (solo la primera vez, puede tardar un poco)...")
 def entrenar():
-    X_total, y, crudo = preparar(cargar_datos())
+    df_original = cargar_datos()
+    X_total, y, crudo = preparar(df_original)
     cols = {'completo': list(X_total.columns),
             'habitos': [c for c in X_total.columns if c not in ('Weight', 'Height')]}
 
     # Misma partición del notebook: 80/20, estratificada, random_state=42
     idx_train, idx_test = train_test_split(X_total.index, test_size=0.2, stratify=y, random_state=42)
     y_train, y_test = y.loc[idx_train], y.loc[idx_test]
+    X_train = {k: X_total.loc[idx_train, c] for k, c in cols.items()}
+    X_test = {k: X_total.loc[idx_test, c] for k, c in cols.items()}
 
-    modelos, preds, filas = {}, {}, {}
+    modelos, preds, filas, f1_train = {}, {}, {}, {}
     for conjunto, columnas in cols.items():
         filas[conjunto] = {}
         for nombre, fabrica in MODELOS.items():
-            pipe = construir_pipeline(fabrica(), columnas).fit(X_total.loc[idx_train, columnas], y_train)
-            pred = pipe.predict(X_total.loc[idx_test, columnas])
+            pipe = construir_pipeline(fabrica(), columnas).fit(X_train[conjunto], y_train)
+            pred = pipe.predict(X_test[conjunto])
             modelos[(conjunto, nombre)] = pipe
             preds[(conjunto, nombre)] = pred
-            filas[conjunto][nombre] = {
-                'Accuracy': accuracy_score(y_test, pred),
-                'Recall macro': recall_score(y_test, pred, average='macro'),
-                'F1 macro': f1_score(y_test, pred, average='macro'),
-            }
+            filas[conjunto][nombre] = metricas(y_test, pred)
+            f1_train[(conjunto, nombre)] = f1_score(y_train, pipe.predict(X_train[conjunto]), average='macro')
     tablas = {k: pd.DataFrame(v).T.round(3) for k, v in filas.items()}
+
+    # Valores por defecto (solo conjunto de hábitos, como en el notebook) y línea base
+    filas_def = {}
+    for nombre, fabrica in MODELOS_DEFECTO.items():
+        pipe = construir_pipeline(fabrica(), cols['habitos']).fit(X_train['habitos'], y_train)
+        filas_def[nombre] = metricas(y_test, pipe.predict(X_test['habitos']))
+    base = DummyClassifier(strategy='most_frequent').fit(X_train['habitos'], y_train)
+    baseline = metricas(y_test, base.predict(X_test['habitos']))
+
     rangos = {c: (float(crudo[c].min()), float(crudo[c].max())) for c in ['Age', 'Height', 'Weight']}
-    return {'modelos': modelos, 'preds': preds, 'tablas': tablas, 'cols': cols,
-            'y_test': y_test, 'crudo': crudo, 'rangos': rangos}
+    return {'modelos': modelos, 'preds': preds, 'tablas': tablas, 'cols': cols, 'f1_train': f1_train,
+            'tabla_def': pd.DataFrame(filas_def).T.round(3), 'baseline': baseline,
+            'X_train': X_train, 'X_test': X_test, 'y_train': y_train, 'y_test': y_test,
+            'crudo': crudo, 'rangos': rangos, 'n_original': len(df_original)}
+
+
+def metricas_rapidas(y, p):
+    """Accuracy, Recall macro y F1 macro calculados con la matriz de confusión (rápido, para el bootstrap)."""
+    cm = np.bincount(7 * y + p, minlength=49).reshape(7, 7)
+    tp = np.diag(cm)
+    fn, fp = cm.sum(1) - tp, cm.sum(0) - tp
+    with np.errstate(divide='ignore', invalid='ignore'):
+        rec = np.where(tp + fn > 0, tp / (tp + fn), 0.0)
+        f1 = np.where(2 * tp + fp + fn > 0, 2 * tp / (2 * tp + fp + fn), 0.0)
+    return tp.sum() / cm.sum(), rec.mean(), f1.mean()
+
+
+@st.cache_data(show_spinner=False)
+def ic_bootstrap(conjunto, nombre):
+    """Intervalo de confianza del 95 % por bootstrap (1000 remuestreos del conjunto de prueba), como en el Paso 10.2."""
+    art = entrenar()
+    y = art['y_test'].to_numpy().astype(int)
+    p = np.asarray(art['preds'][(conjunto, nombre)]).astype(int)
+    rng = np.random.default_rng(42)
+    boot = []
+    for _ in range(1000):
+        i = rng.integers(0, len(y), len(y))
+        boot.append(metricas_rapidas(y[i], p[i]))
+    boot = np.array(boot)
+    valor = metricas_rapidas(y, p)
+    return pd.DataFrame({'Valor en prueba': valor,
+                         'IC 95 % inferior': np.percentile(boot, 2.5, axis=0),
+                         'IC 95 % superior': np.percentile(boot, 97.5, axis=0)},
+                        index=['Accuracy', 'Recall macro', 'F1 macro']).round(3)
+
+
+@st.cache_resource(show_spinner="Calculando la validación cruzada (5 pliegues x 4 modelos)...")
+def validacion_cruzada():
+    """Paso 8.1: validación cruzada estratificada de 5 pliegues sobre el entrenamiento (solo hábitos)."""
+    art = entrenar()
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    scoring = {'Accuracy': 'accuracy', 'Recall macro': 'recall_macro', 'F1 macro': 'f1_macro'}
+    out = {}
+    for nombre, fabrica in MODELOS.items():
+        pipe = construir_pipeline(fabrica(), art['cols']['habitos'])
+        out[nombre] = cross_validate(pipe, art['X_train']['habitos'], art['y_train'], cv=cv,
+                                     scoring=scoring, n_jobs=-1)
+    return out
+
+
+@st.cache_resource(show_spinner="Calculando la importancia por permutación...")
+def importancia_permutacion():
+    """Paso 11: importancia por permutación del modelo final (solo hábitos)."""
+    art = entrenar()
+    pipe = art['modelos'][('habitos', MODELO_FINAL)]
+    pi = permutation_importance(pipe, art['X_test']['habitos'], art['y_test'], scoring='f1_macro',
+                                n_repeats=10, random_state=42, n_jobs=-1)
+    return (pd.DataFrame({'Variable': art['cols']['habitos'], 'Caída media del F1': pi.importances_mean,
+                          'Desv. est.': pi.importances_std})
+            .sort_values('Caída media del F1', ascending=False).reset_index(drop=True))
 
 
 # ----------------------------------------------------------------------------
@@ -246,6 +344,10 @@ def grafico_proba(clases, probs, clase_pred):
     return estilo(fig, 300)
 
 
+def nombre_modelo_visible(n):
+    return f"{n} · modelo final" if n == MODELO_FINAL else n
+
+
 # ----------------------------------------------------------------------------
 # 5. INTERFAZ
 # ----------------------------------------------------------------------------
@@ -263,9 +365,10 @@ except Exception as e:  # sin internet o sin el CSV local
 
 # ----- Barra lateral -----
 with st.sidebar:
-    st.markdown('<div class="rotulo">Configuración</div>', unsafe_allow_html=True)
+    st.markdown('<div class="rotulo" style="margin-top:0">Configuración</div>', unsafe_allow_html=True)
     nombre_modelo = st.selectbox("Modelo de predicción", list(MODELOS.keys()),
-                                 help="Elige el algoritmo que hará la predicción.")
+                                 format_func=nombre_modelo_visible,
+                                 help="Elige el algoritmo. Todos usan los hiperparámetros ajustados en el Paso 9.")
     conjunto = st.radio("Variables que usa el modelo", list(CONJUNTOS.keys()),
                         format_func=lambda k: CONJUNTOS[k],
                         help="'Completo' usa peso y estatura (equivale a calcular con el IMC). "
@@ -273,9 +376,14 @@ with st.sidebar:
     st.markdown('<div class="nota">En el notebook se detectó que el nivel de obesidad se calculó a partir '
                 'del IMC (peso/estatura²). Por eso el modelo <b>completo</b> acierta más (~95 %) pero casi '
                 're-aprende esa fórmula. El modelo <b>solo hábitos</b> (~83 %) mide el efecto real de los '
-                'hábitos.</div>', unsafe_allow_html=True)
+                'hábitos y es el resultado oficial del proyecto.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="creditos">Curso: Introducción a los Sistemas Inteligentes<br>'
+                'Noviembre 2026<br>'
+                'Integrantes: David Borja Rivero, Roni Mendiz Barrios, Maicol Anaya Lucas<br>'
+                'Docente: Sergio Antonio Sánchez Hernández</div>', unsafe_allow_html=True)
 
-tab_pred, tab_modelos, tab_datos = st.tabs(["Predicción", "Resultados de los modelos", "Exploración de datos"])
+tab_pred, tab_modelos, tab_cv, tab_datos = st.tabs(
+    ["Predicción", "Resultados de los modelos", "Validación y análisis", "Exploración de datos"])
 
 # ============================ TAB 1: PREDICCIÓN ============================
 with tab_pred:
@@ -339,7 +447,7 @@ with tab_pred:
 
     # ---------- Columna derecha: resultados ----------
     with der:
-        rotulo(f"Resultado · {nombre_modelo}")
+        rotulo(f"Resultado · {nombre_modelo_visible(nombre_modelo)}")
         st.markdown(f'<div class="hero" style="border-left:4px solid {color}">'
                     f'<div class="k">Nivel estimado</div>'
                     f'<div class="nivel" style="color:{color}">{ETIQUETAS[clase]}</div></div>',
@@ -361,22 +469,30 @@ with tab_pred:
         if nombre_modelo == 'SVM (RBF)':
             st.caption("En la SVM las probabilidades son una estimación aparte, por lo que a veces no coinciden "
                        "exactamente con la clase predicha.")
+        if conjunto == 'habitos':
+            st.caption("Este modelo no usa peso ni estatura: el IMC se muestra solo como referencia.")
         st.caption("Herramienta académica. No reemplaza un diagnóstico médico.")
 
 # ======================== TAB 2: RESULTADOS DE MODELOS ========================
 with tab_modelos:
     tabla = art['tablas'][conjunto]
-    rotulo(f"{nombre_modelo} · {CONJUNTOS[conjunto]}")
-    k1, k2, k3 = st.columns(3)
+    pred_sel = art['preds'][(conjunto, nombre_modelo)]
+    base = art['baseline']
+    rotulo(f"{nombre_modelo_visible(nombre_modelo)} · {CONJUNTOS[conjunto]} · conjunto de prueba (418 registros)")
+
+    k1, k2, k3, k4 = st.columns(4)
     k1.metric("Accuracy", f"{tabla.loc[nombre_modelo, 'Accuracy']:.3f}")
     k2.metric("Recall macro", f"{tabla.loc[nombre_modelo, 'Recall macro']:.3f}")
     k3.metric("F1 macro", f"{tabla.loc[nombre_modelo, 'F1 macro']:.3f}")
+    k4.metric("Veces mejor que el baseline", f"{tabla.loc[nombre_modelo, 'Accuracy'] / base['Accuracy']:.1f}×",
+              help="El baseline siempre predice la clase más frecuente (Accuracy 0.167).")
 
-    st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:.6rem'></div>", unsafe_allow_html=True)
     g1, g2 = st.columns([6, 5], gap="large")
     with g1:
-        rotulo("Comparación de los 4 modelos (conjunto de prueba)")
-        largo = tabla.rename_axis('Modelo').reset_index().melt(id_vars='Modelo', var_name='Métrica', value_name='Valor')
+        rotulo("Comparación de los 4 modelos ajustados y el baseline")
+        tabla_cmp = pd.concat([pd.DataFrame({'Baseline': base}).T.round(3), tabla])
+        largo = tabla_cmp.rename_axis('Modelo').reset_index().melt(id_vars='Modelo', var_name='Métrica', value_name='Valor')
         fig = px.bar(largo, x='Modelo', y='Valor', color='Métrica', barmode='group', text_auto='.2f',
                      color_discrete_sequence=['#4FB3A5', '#C9A24D', '#7F8798'])
         fig.update_yaxes(range=[0, 1.05])
@@ -386,20 +502,138 @@ with tab_modelos:
         st.caption("Partición 80/20 estratificada (random_state=42), igual que en el notebook.")
     with g2:
         rotulo(f"Matriz de confusión · {nombre_modelo}")
-        cm = confusion_matrix(art['y_test'], art['preds'][(conjunto, nombre_modelo)], labels=list(range(7)))
-        fig = px.imshow(cm, x=ETIQUETAS, y=ETIQUETAS, text_auto=True, aspect="auto",
+        modo = st.radio("Vista", ["Conteos", "Normalizada por fila"], horizontal=True, label_visibility="collapsed")
+        cm = confusion_matrix(art['y_test'], pred_sel, labels=list(range(7)))
+        if modo == "Conteos":
+            z, fmt = cm, True
+        else:
+            z, fmt = cm / cm.sum(axis=1, keepdims=True), '.0%'
+        fig = px.imshow(z, x=ETIQUETAS, y=ETIQUETAS, text_auto=fmt, aspect="auto",
                         color_continuous_scale=[[0, "#14171D"], [1, "#4FB3A5"]])
         fig.update_layout(coloraxis_showscale=False, xaxis_title="Predicción", yaxis_title="Real")
         fig.update_xaxes(tickangle=-40)
-        mostrar(estilo(fig, 380))
+        mostrar(estilo(fig, 350))
 
-    rotulo("Tabla de métricas")
-    st.dataframe(tabla.style.highlight_max(axis=0, props="background-color: #1F4A43; color: #FFFFFF;")
-                 .format("{:.3f}"))
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        rotulo(f"Desempeño por clase · {nombre_modelo}")
+        rep = classification_report(art['y_test'], pred_sel, labels=list(range(7)), target_names=ETIQUETAS,
+                                    output_dict=True, zero_division=0)
+        df_rep = pd.DataFrame(rep).T.loc[ETIQUETAS, ['precision', 'recall', 'f1-score', 'support']]
+        fig = go.Figure(go.Bar(x=ETIQUETAS, y=df_rep['f1-score'], marker_color=COLORES,
+                               text=[f"{v:.2f}" for v in df_rep['f1-score']], textposition="outside",
+                               cliponaxis=False))
+        fig.update_yaxes(range=[0, 1.1], title="F1 por clase")
+        fig.update_xaxes(tickangle=-30)
+        mostrar(estilo(fig, 300))
+        st.dataframe(df_rep.style.format({'precision': '{:.3f}', 'recall': '{:.3f}', 'f1-score': '{:.3f}',
+                                          'support': '{:.0f}'}))
+    with c2:
+        rotulo(f"Métricas con intervalo de confianza del 95 % · {nombre_modelo}")
+        st.dataframe(ic_bootstrap(conjunto, nombre_modelo).style.format("{:.3f}"))
+        st.caption("Bootstrap con 1000 remuestreos del conjunto de prueba (Paso 10.2): indica cuánto podría "
+                   "variar el resultado solo por el azar de qué registros cayeron en la prueba.")
 
-# ========================== TAB 3: EXPLORACIÓN ==========================
+        rotulo("Tamaño de los errores")
+        y_t = art['y_test'].to_numpy().astype(int)
+        y_p = np.asarray(pred_sel).astype(int)
+        err = y_t != y_p
+        dist = np.abs(y_t - y_p)[err]
+        n_err = int(err.sum())
+        e1, e2, e3 = st.columns(3)
+        e1.metric("Errores", f"{n_err} de {len(y_t)}")
+        e2.metric("A clase vecina", f"{(dist == 1).sum() / n_err:.0%}" if n_err else "—")
+        e3.metric("Acierto ±1 clase", f"{(np.abs(y_t - y_p) <= 1).mean():.1%}")
+        st.caption("Como las clases tienen orden, confundir clases vecinas es un error leve; confundir clases "
+                   "lejanas es grave.")
+
+    d1, d2 = st.columns(2, gap="large")
+    with d1:
+        rotulo("Efecto del ajuste de hiperparámetros (solo hábitos, F1 macro en prueba)")
+        dv = (pd.DataFrame({'Por defecto': art['tabla_def']['F1 macro'],
+                            'Ajustado': art['tablas']['habitos']['F1 macro']})
+              .rename_axis('Modelo').reset_index()
+              .melt(id_vars='Modelo', var_name='Configuración', value_name='F1 macro'))
+        fig = px.bar(dv, x='Modelo', y='F1 macro', color='Configuración', barmode='group', text_auto='.3f',
+                     color_discrete_sequence=['#7F8798', '#4FB3A5'])
+        fig.update_yaxes(range=[0, 1.05])
+        fig.update_xaxes(title=None)
+        fig.update_layout(legend=dict(orientation="h", y=1.12, x=0, title=None))
+        mostrar(estilo(fig, 330))
+        st.caption("La SVM es la gran beneficiada del ajuste; el Random Forest ya estaba cerca del óptimo.")
+    with d2:
+        rotulo("Sobreajuste: entrenamiento vs. prueba")
+        sob = pd.DataFrame({'F1 entrenamiento': {n: art['f1_train'][(conjunto, n)] for n in MODELOS},
+                            'F1 prueba': tabla['F1 macro']})
+        sob['Brecha'] = sob['F1 entrenamiento'] - sob['F1 prueba']
+        st.dataframe(sob.style.format("{:.3f}"))
+        rotulo(f"Hiperparámetros ajustados · {nombre_modelo}")
+        hp = pd.DataFrame([{'Hiperparámetro': k, 'Por defecto': str(v[0]), 'Ajustado': str(v[1])}
+                           for k, v in HIPERPARAMETROS[nombre_modelo].items()])
+        st.dataframe(hp, hide_index=True)
+
+# ======================= TAB 3: VALIDACIÓN Y ANÁLISIS =======================
+with tab_cv:
+    rotulo("Validación cruzada e importancia de variables · solo hábitos")
+    st.markdown("Estos cálculos reentrenan los modelos varias veces, por eso se ejecutan solo cuando los pides "
+                "(tardan alrededor de un minuto la primera vez y luego quedan guardados).")
+    if st.button("Calcular validación cruzada e importancia por permutación", type="primary"):
+        st.session_state['analisis_avanzado'] = True
+
+    if st.session_state.get('analisis_avanzado'):
+        cvres = validacion_cruzada()
+        rotulo("Validación cruzada estratificada de 5 pliegues (sobre el entrenamiento)")
+        tabla_cv = pd.DataFrame({n: {m: f"{r['test_' + m].mean():.3f} ± {r['test_' + m].std():.3f}"
+                                     for m in ['Accuracy', 'Recall macro', 'F1 macro']}
+                                 for n, r in cvres.items()}).T
+        f1_medio = {n: r['test_F1 macro'].mean() for n, r in cvres.items()}
+        ranking = sorted(f1_medio, key=f1_medio.get, reverse=True)
+        m1, m2 = ranking[0], ranking[1]
+        dif = cvres[m1]['test_F1 macro'] - cvres[m2]['test_F1 macro']
+
+        v1, v2 = st.columns([5, 6], gap="large")
+        with v1:
+            st.dataframe(tabla_cv)
+            st.markdown(tarjeta("Mejor en validación cruzada", m1,
+                                f"gana a {m2} en {int((dif > 0).sum())} de {len(dif)} pliegues "
+                                f"(diferencia media de F1: {dif.mean():+.3f})", COLORES[1]),
+                        unsafe_allow_html=True)
+        with v2:
+            fig = go.Figure()
+            paleta = ['#4FB3A5', '#C9A24D', '#7F8798', '#B07A9E']
+            for i, (n, r) in enumerate(cvres.items()):
+                fig.add_trace(go.Box(y=r['test_F1 macro'], name=n, marker_color=paleta[i], boxpoints='all',
+                                     line=dict(width=1.5), showlegend=False))
+            fig.update_yaxes(title="F1 macro por pliegue")
+            mostrar(estilo(fig, 340))
+        st.caption("Una desviación pequeña indica un modelo estable. Si las cajas de dos modelos se solapan, "
+                   "la diferencia entre ellos no es concluyente.")
+
+        rotulo(f"Importancia por permutación · {MODELO_FINAL} ajustado (modelo final)")
+        imp = importancia_permutacion()
+        fig = go.Figure(go.Bar(x=imp['Caída media del F1'], y=imp['Variable'], orientation='h',
+                               error_x=dict(type='data', array=imp['Desv. est.'], color='#8B909C'),
+                               marker_color='#4FB3A5'))
+        fig.update_yaxes(autorange="reversed")
+        fig.update_xaxes(title="Caída del F1 macro al barajar la variable (mayor = más importante)")
+        mostrar(estilo(fig, 520))
+        st.caption("Cuidado al interpretarla: el peso de Gender_Male, Age y FCVC está inflado por el origen "
+                   "sintético del dataset (SMOTE). Describe asociaciones en estos datos, no causas.")
+    else:
+        st.info("Pulsa el botón para calcular. Mientras tanto, los resultados de prueba están en la pestaña "
+                "'Resultados de los modelos'.")
+
+# ========================== TAB 4: EXPLORACIÓN ==========================
 with tab_datos:
     crudo = art['crudo']
+    n_dup = art['n_original'] - len(crudo)
+    t1, t2, t3, t4 = st.columns(4)
+    t1.markdown(tarjeta("Registros", f"{len(crudo):,}".replace(",", "."), f"tras quitar {n_dup} duplicados"),
+                unsafe_allow_html=True)
+    t2.markdown(tarjeta("Variables predictoras", "16", "más la variable objetivo"), unsafe_allow_html=True)
+    t3.markdown(tarjeta("Clases", "7", "balanceadas (13 % a 17 % c/u)"), unsafe_allow_html=True)
+    t4.markdown(tarjeta("Datos sintéticos", "≈ 77 %", "generados con SMOTE"), unsafe_allow_html=True)
+
     c1, c2 = st.columns(2, gap="large")
     with c1:
         rotulo("Distribución de los niveles de obesidad")
@@ -407,7 +641,6 @@ with tab_datos:
         fig = go.Figure(go.Bar(x=ETIQUETAS, y=conteo.values, marker_color=COLORES,
                                text=conteo.values, textposition="outside", cliponaxis=False))
         fig.update_xaxes(tickangle=-30)
-        fig.update_yaxes(showgrid=True)
         mostrar(estilo(fig, 360))
     with c2:
         rotulo("IMC por nivel de obesidad")
@@ -419,7 +652,28 @@ with tab_datos:
         fig.update_xaxes(tickangle=-30)
         mostrar(estilo(fig, 360))
     st.caption("Cada nivel ocupa un tramo casi propio de IMC: el nivel se calculó a partir del IMC "
-               "(la fuga de datos que se explica en el notebook).")
+               "(la fuga de datos que se explica en el notebook, Paso 5.5).")
+
+    e1, e2 = st.columns([5, 6], gap="large")
+    with e1:
+        rotulo("IMC mínimo, máximo y promedio por clase")
+        tabla_imc = (d.groupby('Nivel')['IMC'].agg(['min', 'max', 'mean']).loc[ETIQUETAS]
+                     .rename(columns={'min': 'IMC mínimo', 'max': 'IMC máximo', 'mean': 'IMC promedio'}))
+        st.dataframe(tabla_imc.style.format("{:.1f}"))
+    with e2:
+        rotulo("Correlación entre variables numéricas")
+        corr = crudo[NUM_COLS].corr()
+        fig = px.imshow(corr, text_auto='.2f', zmin=-1, zmax=1, aspect="auto",
+                        color_continuous_scale=[[0, "#D04E40"], [0.5, "#14171D"], [1, "#4FB3A5"]])
+        fig.update_layout(coloraxis_showscale=False)
+        mostrar(estilo(fig, 360))
+
+    rotulo("Distribución de una variable numérica")
+    var = st.selectbox("Variable", NUM_COLS, label_visibility="collapsed")
+    fig = px.histogram(crudo, x=var, nbins=20, color_discrete_sequence=['#4FB3A5'])
+    fig.update_traces(marker_line_color="#0E1014", marker_line_width=1)
+    fig.update_yaxes(title="Registros")
+    mostrar(estilo(fig, 300))
 
     rotulo("Vista previa de los datos")
     st.dataframe(crudo.head(50))
