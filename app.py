@@ -264,7 +264,7 @@ def validacion_cruzada():
     for nombre, fabrica in MODELOS.items():
         pipe = construir_pipeline(fabrica(), art['cols']['habitos'])
         out[nombre] = cross_validate(pipe, art['X_train']['habitos'], art['y_train'], cv=cv,
-                                     scoring=scoring, n_jobs=-1)
+                                     scoring=scoring, n_jobs=1)
     return out
 
 
@@ -274,7 +274,7 @@ def importancia_permutacion():
     art = entrenar()
     pipe = art['modelos'][('habitos', MODELO_FINAL)]
     pi = permutation_importance(pipe, art['X_test']['habitos'], art['y_test'], scoring='f1_macro',
-                                n_repeats=10, random_state=42, n_jobs=-1)
+                                n_repeats=10, random_state=42, n_jobs=1)
     return (pd.DataFrame({'Variable': art['cols']['habitos'], 'Caída media del F1': pi.importances_mean,
                           'Desv. est.': pi.importances_std})
             .sort_values('Caída media del F1', ascending=False).reset_index(drop=True))
