@@ -16,11 +16,10 @@ import streamlit as st
 from sklearn.compose import ColumnTransformer
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (accuracy_score, classification_report, confusion_matrix, f1_score,
                              recall_score)
-from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
+from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
@@ -75,6 +74,32 @@ HIPERPARAMETROS = {
     'SVM (RBF)': {'C': (1, 10), 'gamma': ('scale', 0.3)},
     'Regresión logística': {'C': (1, 100)},
 }
+
+# Resultados del notebook que no se recalculan en la app (valores fijos con random_state=42)
+_MODELOS_ORDEN = ['Random Forest', 'Árbol de decisión', 'SVM (RBF)', 'Regresión logística']
+# Paso 8.1: validación cruzada de 5 pliegues, hiperparámetros por defecto, solo hábitos
+CV_DEFECTO = pd.DataFrame({
+    'Accuracy (media)':     [0.854, 0.723, 0.745, 0.575],
+    'Recall macro (media)': [0.851, 0.717, 0.741, 0.564],
+    'F1 macro (media)':     [0.851, 0.717, 0.733, 0.547],
+    'F1 macro (desv.)':     [0.021, 0.019, 0.016, 0.024],
+}, index=_MODELOS_ORDEN)
+# Paso 9: GridSearchCV (F1 macro en validación cruzada, antes y después del ajuste)
+RESUMEN_BUSQUEDA = pd.DataFrame({
+    'F1 CV por defecto':      [0.851, 0.717, 0.733, 0.547],
+    'F1 CV ajustado':         [0.853, 0.734, 0.795, 0.556],
+    'Mejora (puntos)':        [0.2, 1.7, 6.2, 1.0],
+    'Combinaciones probadas': [24, 48, 30, 6],
+}, index=_MODELOS_ORDEN)
+# Paso 11: importancia por permutación del modelo final (caída media del F1 macro, desviación estándar)
+IMPORTANCIA_PERMUTACION = [
+    ('Gender_Male', 0.215, 0.017), ('Age', 0.189, 0.019), ('FCVC', 0.184, 0.014),
+    ('family_history_with_overweight', 0.103, 0.011), ('NCP', 0.070, 0.009), ('CALC', 0.054, 0.016),
+    ('CAEC', 0.044, 0.007), ('CH2O', 0.038, 0.011), ('TUE', 0.033, 0.007), ('FAF', 0.022, 0.008),
+    ('MTRANS_Public_Transportation', 0.014, 0.005), ('FAVC', 0.010, 0.004), ('SCC', 0.009, 0.002),
+    ('MTRANS_Walking', 0.002, 0.001), ('SMOKE', 0.000, 0.000), ('MTRANS_Bike', 0.000, 0.000),
+    ('MTRANS_Motorbike', 0.000, 0.001),
+]
 
 # ----------------------------------------------------------------------------
 # 2. ESTILO (CSS + plantilla de gráficos)
@@ -252,32 +277,6 @@ def ic_bootstrap(conjunto, nombre):
                          'IC 95 % inferior': np.percentile(boot, 2.5, axis=0),
                          'IC 95 % superior': np.percentile(boot, 97.5, axis=0)},
                         index=['Accuracy', 'Recall macro', 'F1 macro']).round(3)
-
-
-@st.cache_resource(show_spinner="Calculando la validación cruzada (5 pliegues x 4 modelos)...")
-def validacion_cruzada():
-    """Paso 8.1: validación cruzada estratificada de 5 pliegues sobre el entrenamiento (solo hábitos)."""
-    art = entrenar()
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    scoring = {'Accuracy': 'accuracy', 'Recall macro': 'recall_macro', 'F1 macro': 'f1_macro'}
-    out = {}
-    for nombre, fabrica in MODELOS.items():
-        pipe = construir_pipeline(fabrica(), art['cols']['habitos'])
-        out[nombre] = cross_validate(pipe, art['X_train']['habitos'], art['y_train'], cv=cv,
-                                     scoring=scoring, n_jobs=1)
-    return out
-
-
-@st.cache_resource(show_spinner="Calculando la importancia por permutación...")
-def importancia_permutacion():
-    """Paso 11: importancia por permutación del modelo final (solo hábitos)."""
-    art = entrenar()
-    pipe = art['modelos'][('habitos', MODELO_FINAL)]
-    pi = permutation_importance(pipe, art['X_test']['habitos'], art['y_test'], scoring='f1_macro',
-                                n_repeats=10, random_state=42, n_jobs=1)
-    return (pd.DataFrame({'Variable': art['cols']['habitos'], 'Caída media del F1': pi.importances_mean,
-                          'Desv. est.': pi.importances_std})
-            .sort_values('Caída media del F1', ascending=False).reset_index(drop=True))
 
 
 # ----------------------------------------------------------------------------
@@ -574,54 +573,39 @@ with tab_modelos:
 
 # ======================= TAB 3: VALIDACIÓN Y ANÁLISIS =======================
 with tab_cv:
-    rotulo("Validación cruzada e importancia de variables · solo hábitos")
-    st.markdown("Estos cálculos reentrenan los modelos varias veces, por eso se ejecutan solo cuando los pides "
-                "(tardan alrededor de un minuto la primera vez y luego quedan guardados).")
-    if st.button("Calcular validación cruzada e importancia por permutación", type="primary"):
-        st.session_state['analisis_avanzado'] = True
+    st.caption("Resultados de los Pasos 8, 9 y 11 del notebook, obtenidos con la misma partición del proyecto "
+               "(random_state=42). Son valores fijos: no se recalculan en la app.")
+    v1, v2 = st.columns([5, 6], gap="large")
+    with v1:
+        rotulo("Validación cruzada de 5 pliegues · hiperparámetros por defecto")
+        st.dataframe(CV_DEFECTO.style.format("{:.3f}"))
+        st.caption("Solo hábitos, sobre el conjunto de entrenamiento. Una desviación pequeña indica un modelo estable.")
+        st.markdown(tarjeta("Mejor modelo en validación cruzada", "Random Forest",
+                            "gana a la SVM en 5 de 5 pliegues (diferencia media de F1 macro: +0.058)", COLORES[1]),
+                    unsafe_allow_html=True)
+    with v2:
+        rotulo("Antes y después del ajuste de hiperparámetros")
+        dv = (RESUMEN_BUSQUEDA[['F1 CV por defecto', 'F1 CV ajustado']].rename_axis('Modelo').reset_index()
+              .melt(id_vars='Modelo', var_name='Configuración', value_name='F1 macro (validación cruzada)'))
+        fig = px.bar(dv, x='Modelo', y='F1 macro (validación cruzada)', color='Configuración', barmode='group',
+                     text_auto='.3f', color_discrete_sequence=['#7F8798', '#4FB3A5'])
+        fig.update_yaxes(range=[0, 1.05])
+        fig.update_xaxes(title=None)
+        fig.update_layout(legend=dict(orientation="h", y=1.12, x=0, title=None))
+        mostrar(estilo(fig, 320))
+        st.dataframe(RESUMEN_BUSQUEDA.style.format({'F1 CV por defecto': '{:.3f}', 'F1 CV ajustado': '{:.3f}',
+                                                    'Mejora (puntos)': '{:.1f}', 'Combinaciones probadas': '{:.0f}'}))
 
-    if st.session_state.get('analisis_avanzado'):
-        cvres = validacion_cruzada()
-        rotulo("Validación cruzada estratificada de 5 pliegues (sobre el entrenamiento)")
-        tabla_cv = pd.DataFrame({n: {m: f"{r['test_' + m].mean():.3f} ± {r['test_' + m].std():.3f}"
-                                     for m in ['Accuracy', 'Recall macro', 'F1 macro']}
-                                 for n, r in cvres.items()}).T
-        f1_medio = {n: r['test_F1 macro'].mean() for n, r in cvres.items()}
-        ranking = sorted(f1_medio, key=f1_medio.get, reverse=True)
-        m1, m2 = ranking[0], ranking[1]
-        dif = cvres[m1]['test_F1 macro'] - cvres[m2]['test_F1 macro']
-
-        v1, v2 = st.columns([5, 6], gap="large")
-        with v1:
-            st.dataframe(tabla_cv)
-            st.markdown(tarjeta("Mejor en validación cruzada", m1,
-                                f"gana a {m2} en {int((dif > 0).sum())} de {len(dif)} pliegues "
-                                f"(diferencia media de F1: {dif.mean():+.3f})", COLORES[1]),
-                        unsafe_allow_html=True)
-        with v2:
-            fig = go.Figure()
-            paleta = ['#4FB3A5', '#C9A24D', '#7F8798', '#B07A9E']
-            for i, (n, r) in enumerate(cvres.items()):
-                fig.add_trace(go.Box(y=r['test_F1 macro'], name=n, marker_color=paleta[i], boxpoints='all',
-                                     line=dict(width=1.5), showlegend=False))
-            fig.update_yaxes(title="F1 macro por pliegue")
-            mostrar(estilo(fig, 340))
-        st.caption("Una desviación pequeña indica un modelo estable. Si las cajas de dos modelos se solapan, "
-                   "la diferencia entre ellos no es concluyente.")
-
-        rotulo(f"Importancia por permutación · {MODELO_FINAL} ajustado (modelo final)")
-        imp = importancia_permutacion()
-        fig = go.Figure(go.Bar(x=imp['Caída media del F1'], y=imp['Variable'], orientation='h',
-                               error_x=dict(type='data', array=imp['Desv. est.'], color='#8B909C'),
-                               marker_color='#4FB3A5'))
-        fig.update_yaxes(autorange="reversed")
-        fig.update_xaxes(title="Caída del F1 macro al barajar la variable (mayor = más importante)")
-        mostrar(estilo(fig, 520))
-        st.caption("Cuidado al interpretarla: el peso de Gender_Male, Age y FCVC está inflado por el origen "
-                   "sintético del dataset (SMOTE). Describe asociaciones en estos datos, no causas.")
-    else:
-        st.info("Pulsa el botón para calcular. Mientras tanto, los resultados de prueba están en la pestaña "
-                "'Resultados de los modelos'.")
+    rotulo("Importancia por permutación · Random Forest ajustado (solo hábitos)")
+    imp = pd.DataFrame(IMPORTANCIA_PERMUTACION, columns=['Variable', 'Caída media del F1', 'Desv. est.'])
+    fig = go.Figure(go.Bar(x=imp['Caída media del F1'], y=imp['Variable'], orientation='h',
+                           error_x=dict(type='data', array=imp['Desv. est.'], color='#8B909C'),
+                           marker_color='#4FB3A5'))
+    fig.update_yaxes(autorange="reversed")
+    fig.update_xaxes(title="Caída del F1 macro al barajar la variable (mayor = más importante)")
+    mostrar(estilo(fig, 520))
+    st.caption("Cuidado al interpretarla: el peso de Gender_Male, Age y FCVC está inflado por el origen "
+               "sintético del dataset (SMOTE). Describe asociaciones en estos datos, no causas.")
 
 # ========================== TAB 4: EXPLORACIÓN ==========================
 with tab_datos:
